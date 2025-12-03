@@ -205,3 +205,8 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+mlruns/
+*/mlruns/
+02-experiment-tracking/homework/mlruns/
+
