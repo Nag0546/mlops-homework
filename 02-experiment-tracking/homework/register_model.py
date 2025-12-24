@@ -1,159 +1,102 @@
-#!/usr/bin/env python3
 import os
 import pickle
-import argparse
-import pandas as pd
+import click
 import mlflow
-import mlflow.sklearn
+
+from mlflow.entities import ViewType
 from mlflow.tracking import MlflowClient
-from sklearn.metrics import mean_squared_error
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.metrics import root_mean_squared_error
 
-"""
-Updated register_model.py
+HPO_EXPERIMENT_NAME = "random-forest-hyperopt"
+EXPERIMENT_NAME = "random-forest-best-models"
+RF_PARAMS = ['max_depth', 'n_estimators', 'min_samples_split', 'min_samples_leaf', 'random_state']
 
-- Robust checks for missing experiments / runs
-- Handles missing dv.pkl gracefully (skips run)
-- Uses backward-compatible RMSE computation (no `squared` kwarg)
-- Logs evaluation results to a new experiment "random-forest-best-models"
-- Registers the best model (runs:/<RUN_ID>/model) as "best-random-forest"
-"""
-
-TEST_EXPERIMENT_NAME = "random-forest-hyperopt"
-RESULTS_EXPERIMENT_NAME = "random-forest-best-models"
-REGISTERED_MODEL_NAME = "best-random-forest"
-TOP_N = 5
+mlflow.set_tracking_uri("http://127.0.0.1:5000")
+mlflow.set_experiment(EXPERIMENT_NAME)
+mlflow.sklearn.autolog()
 
 
-def read_test_data(file_path: str) -> pd.DataFrame:
-    df = pd.read_parquet(file_path)
-
-    df['lpep_pickup_datetime'] = pd.to_datetime(df['lpep_pickup_datetime'])
-    df['lpep_dropoff_datetime'] = pd.to_datetime(df['lpep_dropoff_datetime'])
-
-    df['duration'] = (
-        df['lpep_dropoff_datetime'] - df['lpep_pickup_datetime']
-    ).dt.total_seconds() / 60
-
-    df = df[(df.duration >= 1) & (df.duration <= 60)]
-
-    df['PULocationID'] = df['PULocationID'].astype(str)
-    df['DOLocationID'] = df['DOLocationID'].astype(str)
-
-    return df
+def load_pickle(filename):
+    with open(filename, "rb") as f_in:
+        return pickle.load(f_in)
 
 
-def evaluate_and_register(data_path: str):
+def train_and_log_model(data_path, params):
+    X_train, y_train = load_pickle(os.path.join(data_path, "train.pkl"))
+    X_val, y_val = load_pickle(os.path.join(data_path, "val.pkl"))
+    X_test, y_test = load_pickle(os.path.join(data_path, "test.pkl"))
+
+    with mlflow.start_run() as run:
+        new_params = {}
+        for param in RF_PARAMS:
+            new_params[param] = int(params[param])
+
+        rf = RandomForestRegressor(**new_params)
+        rf.fit(X_train, y_train)
+
+        # Evaluate model on the validation and test sets
+        val_rmse = root_mean_squared_error(y_val, rf.predict(X_val))
+        mlflow.log_metric("val_rmse", val_rmse)
+        test_rmse = root_mean_squared_error(y_test, rf.predict(X_test))
+        mlflow.log_metric("test_rmse", test_rmse)
+
+        # Log the model itself
+        mlflow.sklearn.log_model(rf, artifact_path="model")
+
+        # Print run info for debugging
+        print(f"Run {run.info.run_id} → val_rmse={val_rmse:.3f}, test_rmse={test_rmse:.3f}")
+
+
+@click.command()
+@click.option(
+    "--data_path",
+    default="./output",
+    help="Location where the processed NYC taxi trip data was saved"
+)
+@click.option(
+    "--top_n",
+    default=5,
+    type=int,
+    help="Number of top models that need to be evaluated to decide which one to promote"
+)
+def run_register_model(data_path: str, top_n: int):
+
     client = MlflowClient()
 
-    # locate the hyperopt experiment
-    experiment = mlflow.get_experiment_by_name(TEST_EXPERIMENT_NAME)
-    if experiment is None:
-        print(f"Experiment '{TEST_EXPERIMENT_NAME}' not found. Exiting.")
-        return
-
-    # search top N runs by recorded metric 'rmse' (ascending)
+    # Retrieve the top_n model runs from hyperopt experiment
+    experiment = client.get_experiment_by_name(HPO_EXPERIMENT_NAME)
     runs = client.search_runs(
-        experiment_ids=[experiment.experiment_id],
-        order_by=["metrics.rmse ASC"],
-        max_results=TOP_N,
+        experiment_ids=experiment.experiment_id,
+        run_view_type=ViewType.ACTIVE_ONLY,
+        max_results=top_n,
+        order_by=["metrics.rmse ASC"]
     )
 
-    if not runs:
-        print("No runs found in experiment. Exiting.")
-        return
+    # Train and log each of the top_n models
+    for run in runs:
+        train_and_log_model(data_path=data_path, params=run.data.params)
 
-    # Prepare results experiment (to store evaluation metrics)
-    results_experiment = mlflow.get_experiment_by_name(RESULTS_EXPERIMENT_NAME)
-    if results_experiment is None:
-        results_experiment_id = mlflow.create_experiment(RESULTS_EXPERIMENT_NAME)
-    else:
-        results_experiment_id = results_experiment.experiment_id
+    # Now select the best run from the new experiment (lowest test_rmse)
+    experiment = client.get_experiment_by_name(EXPERIMENT_NAME)
+    best_run = client.search_runs(
+        experiment_ids=experiment.experiment_id,
+        run_view_type=ViewType.ACTIVE_ONLY,
+        max_results=1,
+        order_by=["metrics.test_rmse ASC"]
+    )[0]
 
-    test_file = os.path.join(data_path, "green_tripdata_2023-03.parquet")
-    print("\nEvaluating top %d models on March-2023 test set...\n" % TOP_N)
+    best_run_id = best_run.info.run_id
+    best_rmse = best_run.data.metrics["test_rmse"]
 
-    test_data = read_test_data(test_file)
-    X_test = test_data[['PULocationID', 'DOLocationID']]
-    y_test = test_data['duration']
+    print("\n=== Best Model Selected ===")
+    print(f"Run ID: {best_run_id}")
+    print(f"Best Test RMSE: {best_rmse:.3f}")
 
-    best_rmse = float("inf")
-    best_run_id = None
-    best_model_uri = None
-
-    # Start a run in the results experiment to log per-run RMSEs
-    with mlflow.start_run(experiment_id=results_experiment_id, run_name="eval-top-models"):
-        for run in runs:
-            run_id = run.info.run_id
-            model_uri = f"runs:/{run_id}/model"
-            dv_artifact_path = f"runs:/{run_id}/preprocessor/dv.pkl"
-
-            # Try to download dv.pkl (vectorizer)
-            try:
-                dv_local_path = mlflow.artifacts.download_artifacts(dv_artifact_path)
-                # download_artifacts may return a file path or a directory; handle both
-                if os.path.isdir(dv_local_path):
-                    # find dv.pkl inside
-                    candidate = os.path.join(dv_local_path, "dv.pkl")
-                    if os.path.exists(candidate):
-                        dv_local_path = candidate
-                with open(dv_local_path, "rb") as f:
-                    dv = pickle.load(f)
-            except Exception as e:
-                print(f"❌ Skipping run {run_id}: Cannot load dv.pkl ({e})")
-                # Log that this run was skipped
-                mlflow.log_metric(f"skipped_{run_id}", 1)
-                continue
-
-            # Try to load model
-            try:
-                model = mlflow.sklearn.load_model(model_uri)
-            except Exception as e:
-                print(f"❌ Skipping run {run_id}: Cannot load model ({e})")
-                mlflow.log_metric(f"skipped_model_{run_id}", 1)
-                continue
-
-            # Transform and predict
-            try:
-                X_test_transformed = dv.transform(X_test.to_dict(orient="records"))
-                preds = model.predict(X_test_transformed)
-            except Exception as e:
-                print(f"❌ Skipping run {run_id}: Error during prediction ({e})")
-                mlflow.log_metric(f"skipped_pred_{run_id}", 1)
-                continue
-
-            # Compute RMSE (backward compatible)
-            rmse = mean_squared_error(y_test, preds) ** 0.5
-            print(f"Run {run_id}: Test RMSE = {rmse:.3f}")
-
-            # Log metric for this evaluated run in the results experiment
-            mlflow.log_metric(f"rmse_{run_id}", rmse)
-
-            # Update best model
-            if rmse < best_rmse:
-                best_rmse = rmse
-                best_run_id = run_id
-                best_model_uri = model_uri
-
-        # End of evaluation loop
-
-    if best_model_uri:
-        print(f"\nBest test RMSE: {best_rmse:.3f} (run {best_run_id})")
-        # Register the model in the model registry
-        try:
-            mlflow.register_model(best_model_uri, REGISTERED_MODEL_NAME)
-            print(f"Model registered as '{REGISTERED_MODEL_NAME}' (from run {best_run_id})")
-        except Exception as e:
-            print(f"Failed to register model ({e})")
-    else:
-        print("No valid model found to register.")
+    # Register the best model
+    model_uri = f"runs:/{best_run_id}/model"
+    mlflow.register_model(model_uri=model_uri, name="random-forest-best-model")
 
 
-def main(data_path: str):
-    evaluate_and_register(data_path)
-
-
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Evaluate top models and register the best one.")
-    parser.add_argument("--data_path", required=True, help="Path to directory with test parquet file")
-    args = parser.parse_args()
-    main(args.data_path)
+if __name__ == '__main__':
+    run_register_model()

@@ -1,94 +1,77 @@
 import os
-import math
-import argparse
 import pickle
-import pandas as pd
+import click
 import mlflow
-import mlflow.sklearn
-from hyperopt import fmin, tpe, hp, STATUS_OK, Trials
-from sklearn.feature_extraction import DictVectorizer
-from sklearn.metrics import mean_squared_error
+import numpy as np
+from hyperopt import STATUS_OK, Trials, fmin, hp, tpe
+from hyperopt.pyll import scope
 from sklearn.ensemble import RandomForestRegressor
+from sklearn.metrics import root_mean_squared_error
+
+mlflow.set_tracking_uri("http://127.0.0.1:5000")
+mlflow.set_experiment("random-forest-hyperopt")
 
 
-def load_data(data_path):
-    train_df = pd.read_parquet(os.path.join(data_path, "green_tripdata_2023-01.parquet"))
-    valid_df = pd.read_parquet(os.path.join(data_path, "green_tripdata_2023-02.parquet"))
-
-    features = ["PULocationID", "DOLocationID"]
-    dv = DictVectorizer()
-
-    train_dicts = train_df[features].astype(str).to_dict(orient="records")
-    valid_dicts = valid_df[features].astype(str).to_dict(orient="records")
-
-    X_train = dv.fit_transform(train_dicts)
-    y_train = train_df["duration"].values
-    X_valid = dv.transform(valid_dicts)
-    y_valid = valid_df["duration"].values
-
-    return X_train, y_train, X_valid, y_valid, dv
+def load_pickle(filename: str):
+    with open(filename, "rb") as f_in:
+        return pickle.load(f_in)
 
 
-# Hyperopt search space
-search_space = {
-    "n_estimators": hp.choice("n_estimators", [50, 100, 200]),
-    "max_depth": hp.choice("max_depth", [10, 20, 30, None]),
-    "min_samples_split": hp.choice("min_samples_split", [2, 4, 8, 10]),
-}
+@click.command()
+@click.option(
+    "--data_path",
+    default="./output",
+    help="Location where the processed NYC taxi trip data was saved"
+)
+@click.option(
+    "--num_trials",
+    default=15,
+    help="The number of parameter evaluations for the optimizer to explore"
+)
+def run_optimization(data_path: str, num_trials: int):
 
+    X_train, y_train = load_pickle(os.path.join(data_path, "train.pkl"))
+    X_val, y_val = load_pickle(os.path.join(data_path, "val.pkl"))
 
-def objective(params):
-    with mlflow.start_run():
-        mlflow.log_params(params)
+    def objective(params):
+        with mlflow.start_run():
+            mlflow.log_params(params)
 
-        model = RandomForestRegressor(
-            n_estimators=int(params["n_estimators"]),
-            max_depth=None if params["max_depth"] is None else int(params["max_depth"]),
-            min_samples_split=int(params["min_samples_split"]),
-            random_state=42,
-            n_jobs=-1,
-        )
+            rf = RandomForestRegressor(**params)
+            rf.fit(X_train, y_train)
+            y_pred = rf.predict(X_val)
+            rmse = root_mean_squared_error(y_val, y_pred)
 
-        model.fit(X_train, y_train)
-        preds = model.predict(X_valid)
+            mlflow.log_metric("rmse", rmse)
 
-        # Compute RMSE
-        mse = mean_squared_error(y_valid, preds)
-        rmse = math.sqrt(mse)
-        mlflow.log_metric("rmse", rmse)
+            return {'loss': rmse, 'status': STATUS_OK}
 
-        # Log the model and vectorizer for later use
-        mlflow.sklearn.log_model(model, artifact_path="model")
+    search_space = {
+        'max_depth': scope.int(hp.quniform('max_depth', 1, 20, 1)),
+        'n_estimators': scope.int(hp.quniform('n_estimators', 10, 50, 1)),
+        'min_samples_split': scope.int(hp.quniform('min_samples_split', 2, 10, 1)),
+        'min_samples_leaf': scope.int(hp.quniform('min_samples_leaf', 1, 4, 1)),
+        'random_state': 42
+    }
 
-        with open("dv.pkl", "wb") as f:
-            pickle.dump(dv, f)
-        mlflow.log_artifact("dv.pkl", artifact_path="preprocessor")
-
-        return {"loss": rmse, "status": STATUS_OK}
-
-
-def run_hpo(data_path, max_evals=20):
-    global X_train, y_train, X_valid, y_valid, dv
-    X_train, y_train, X_valid, y_valid, dv = load_data(data_path)
-
-    mlflow.set_experiment("random-forest-hyperopt")
     trials = Trials()
+    rstate = np.random.default_rng(42)
 
-    best_params = fmin(
+    best_result = fmin(
         fn=objective,
         space=search_space,
         algo=tpe.suggest,
-        max_evals=max_evals,
+        max_evals=num_trials,
         trials=trials,
+        rstate=rstate
     )
 
-    print("Best parameters (hyperopt encoding):", best_params)
+    # Print best parameters and RMSE directly in terminal
+    best_rmse = min([t['result']['loss'] for t in trials.trials])
+    print("\n=== Best Result ===")
+    print(f"Best parameters: {best_result}")
+    print(f"Best validation RMSE: {best_rmse:.3f}")
 
 
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--data_path", required=True, help="Path to preprocessed parquet files (./output)")
-    parser.add_argument("--max_evals", default=20, type=int, help="Number of HPO evaluations")
-    args = parser.parse_args()
-
-    run_hpo(args.data_path, args.max_evals)
+if __name__ == '__main__':
+    run_optimization()
